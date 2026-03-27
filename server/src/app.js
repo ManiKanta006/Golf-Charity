@@ -3,6 +3,7 @@ import cors from "cors";
 import dotenv from "dotenv";
 import path from "path";
 import { fileURLToPath } from "url";
+import { existsSync } from "fs";
 
 import authRoutes from "./routes/auth.routes.js";
 import charityRoutes from "./routes/charity.routes.js";
@@ -22,7 +23,12 @@ const __dirname = path.dirname(__filename);
 app.use(cors({ origin: process.env.CLIENT_URL || "http://localhost:5173" }));
 app.post("/api/payments/webhook", express.raw({ type: "application/json" }), handleCashfreeWebhook);
 app.use(express.json());
-app.use("/uploads", express.static(path.resolve(__dirname, "../uploads")));
+
+// Only serve uploads if directory exists (for local development)
+const uploadsDir = path.resolve(__dirname, "../uploads");
+if (existsSync(uploadsDir)) {
+  app.use("/uploads", express.static(uploadsDir));
+}
 
 app.get("/api/health", (_req, res) => {
   res.json({ status: "ok", service: "golf-charity-server" });
