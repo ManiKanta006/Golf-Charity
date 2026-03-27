@@ -17,7 +17,6 @@ This project was built for the Digital Heroes internship selection assignment (P
 
 - `client/` React frontend
 - `server/` Express API, SQL schema/seed, Vercel serverless config
-- `PRD.txt` Assignment PRD reference
 
 ## Core Features
 
