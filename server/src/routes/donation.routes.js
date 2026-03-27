@@ -1,5 +1,5 @@
 import express from "express";
-import { query } from "../db.js";
+import supabase from "../supabaseClient.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
 
 const router = express.Router();
@@ -14,21 +14,30 @@ router.post("/me", requireAuth, async (req, res, next) => {
     }
 
     if (charityId) {
-      const charity = await query(
-        "SELECT id FROM charities WHERE id = ? AND active = 1 LIMIT 1",
-        [charityId]
-      );
-      if (!charity.length) {
+      const { data: charity, error: cErr } = await supabase
+        .from("charities")
+        .select("id")
+        .eq("id", charityId)
+        .eq("active", true)
+        .limit(1);
+
+      if (cErr) throw cErr;
+
+      if (!charity || !charity.length) {
         return res.status(400).json({ message: "Selected charity not found" });
       }
     }
 
-    await query(
-      `INSERT INTO donations (user_id, charity_id, amount, note)
-       VALUES (?, ?, ?, ?)`,
-      [req.user.userId, charityId || null, parsedAmount, note]
-    );
+    const { error } = await supabase
+      .from("donations")
+      .insert({
+        user_id: req.user.userId,
+        charity_id: charityId || null,
+        amount: parsedAmount,
+        note
+      });
 
+    if (error) throw error;
     return res.status(201).json({ message: "Donation recorded" });
   } catch (error) {
     return next(error);
@@ -37,17 +46,22 @@ router.post("/me", requireAuth, async (req, res, next) => {
 
 router.get("/me", requireAuth, async (req, res, next) => {
   try {
-    const rows = await query(
-      `SELECT d.id, d.amount, d.note, d.created_at,
-              c.id AS charity_id, c.name AS charity_name
-       FROM donations d
-       LEFT JOIN charities c ON c.id = d.charity_id
-       WHERE d.user_id = ?
-       ORDER BY d.created_at DESC`,
-      [req.user.userId]
-    );
+    const { data: rows, error } = await supabase
+      .from("donations")
+      .select("id, amount, note, created_at, charity_id, charities(id, name)")
+      .eq("user_id", req.user.userId)
+      .order("created_at", { ascending: false });
 
-    return res.json(rows);
+    if (error) throw error;
+
+    // Flatten the nested charities object to match original response format
+    const flattened = (rows || []).map(({ charities, ...rest }) => ({
+      ...rest,
+      charity_id: rest.charity_id,
+      charity_name: charities?.name || null
+    }));
+
+    return res.json(flattened);
   } catch (error) {
     return next(error);
   }
@@ -55,17 +69,24 @@ router.get("/me", requireAuth, async (req, res, next) => {
 
 router.get("/admin", requireAuth, requireAdmin, async (_req, res, next) => {
   try {
-    const rows = await query(
-      `SELECT d.id, d.amount, d.note, d.created_at,
-              u.id AS user_id, u.name AS user_name, u.email AS user_email,
-              c.id AS charity_id, c.name AS charity_name
-       FROM donations d
-       JOIN users u ON u.id = d.user_id
-       LEFT JOIN charities c ON c.id = d.charity_id
-       ORDER BY d.created_at DESC`
-    );
+    const { data: rows, error } = await supabase
+      .from("donations")
+      .select("id, amount, note, created_at, user_id, users(id, name, email), charity_id, charities(id, name)")
+      .order("created_at", { ascending: false });
 
-    return res.json(rows);
+    if (error) throw error;
+
+    // Flatten nested objects to match original response format
+    const flattened = (rows || []).map(({ users, charities, ...rest }) => ({
+      ...rest,
+      user_id: rest.user_id,
+      user_name: users?.name || null,
+      user_email: users?.email || null,
+      charity_id: rest.charity_id,
+      charity_name: charities?.name || null
+    }));
+
+    return res.json(flattened);
   } catch (error) {
     return next(error);
   }

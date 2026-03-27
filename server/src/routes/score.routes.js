@@ -1,5 +1,5 @@
 import express from "express";
-import { query } from "../db.js";
+import supabase from "../supabaseClient.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
 import { assertActiveSubscription } from "../utils/subscription.js";
 
@@ -11,15 +11,17 @@ function validateScore(score) {
 }
 
 async function trimToLatestFive(userId) {
-  const rows = await query(
-    `SELECT id FROM scores
-     WHERE user_id = ?
-     ORDER BY date_played DESC, created_at DESC
-     LIMIT 100`,
-    [userId]
-  );
+  const { data: rows, error } = await supabase
+    .from("scores")
+    .select("id")
+    .eq("user_id", userId)
+    .order("date_played", { ascending: false })
+    .order("created_at", { ascending: false })
+    .limit(100);
 
-  if (rows.length <= 5) {
+  if (error) throw error;
+
+  if (!rows || rows.length <= 5) {
     return;
   }
 
@@ -28,23 +30,25 @@ async function trimToLatestFive(userId) {
     return;
   }
 
-  await query(
-    `DELETE FROM scores WHERE id IN (${idsToDelete.map(() => "?").join(",")})`,
-    idsToDelete
-  );
+  const { error: delErr } = await supabase
+    .from("scores")
+    .delete()
+    .in("id", idsToDelete);
+
+  if (delErr) throw delErr;
 }
 
 router.get("/me", requireAuth, async (req, res, next) => {
   try {
-    const rows = await query(
-      `SELECT id, score, date_played, created_at
-       FROM scores
-       WHERE user_id = ?
-       ORDER BY date_played DESC, created_at DESC`,
-      [req.user.userId]
-    );
+    const { data: rows, error } = await supabase
+      .from("scores")
+      .select("id, score, date_played, created_at")
+      .eq("user_id", req.user.userId)
+      .order("date_played", { ascending: false })
+      .order("created_at", { ascending: false });
 
-    return res.json(rows);
+    if (error) throw error;
+    return res.json(rows || []);
   } catch (error) {
     return next(error);
   }
@@ -65,10 +69,11 @@ router.post("/me", requireAuth, async (req, res, next) => {
       return res.status(400).json({ message: "Score must be 1-45 and date is required" });
     }
 
-    await query(
-      "INSERT INTO scores (user_id, score, date_played) VALUES (?, ?, ?)",
-      [req.user.userId, Number(score), datePlayed]
-    );
+    const { error } = await supabase
+      .from("scores")
+      .insert({ user_id: req.user.userId, score: Number(score), date_played: datePlayed });
+
+    if (error) throw error;
 
     await trimToLatestFive(req.user.userId);
     return res.status(201).json({ message: "Score added" });
@@ -93,14 +98,16 @@ router.put("/me/:scoreId", requireAuth, async (req, res, next) => {
       return res.status(400).json({ message: "Score must be 1-45 and date is required" });
     }
 
-    const result = await query(
-      `UPDATE scores
-       SET score = ?, date_played = ?
-       WHERE id = ? AND user_id = ?`,
-      [Number(score), datePlayed, scoreId, req.user.userId]
-    );
+    const { data, error } = await supabase
+      .from("scores")
+      .update({ score: Number(score), date_played: datePlayed })
+      .eq("id", scoreId)
+      .eq("user_id", req.user.userId)
+      .select();
 
-    if (result.affectedRows === 0) {
+    if (error) throw error;
+
+    if (!data || data.length === 0) {
       return res.status(404).json({ message: "Score not found" });
     }
 
@@ -112,15 +119,15 @@ router.put("/me/:scoreId", requireAuth, async (req, res, next) => {
 
 router.get("/admin/:userId", requireAuth, requireAdmin, async (req, res, next) => {
   try {
-    const rows = await query(
-      `SELECT id, score, date_played, created_at
-       FROM scores
-       WHERE user_id = ?
-       ORDER BY date_played DESC, created_at DESC`,
-      [req.params.userId]
-    );
+    const { data: rows, error } = await supabase
+      .from("scores")
+      .select("id, score, date_played, created_at")
+      .eq("user_id", req.params.userId)
+      .order("date_played", { ascending: false })
+      .order("created_at", { ascending: false });
 
-    return res.json(rows);
+    if (error) throw error;
+    return res.json(rows || []);
   } catch (error) {
     return next(error);
   }
@@ -139,14 +146,16 @@ router.put(
         return res.status(400).json({ message: "Score must be 1-45 and date is required" });
       }
 
-      const result = await query(
-        `UPDATE scores
-         SET score = ?, date_played = ?
-         WHERE id = ? AND user_id = ?`,
-        [Number(score), datePlayed, scoreId, userId]
-      );
+      const { data, error } = await supabase
+        .from("scores")
+        .update({ score: Number(score), date_played: datePlayed })
+        .eq("id", scoreId)
+        .eq("user_id", userId)
+        .select();
 
-      if (result.affectedRows === 0) {
+      if (error) throw error;
+
+      if (!data || data.length === 0) {
         return res.status(404).json({ message: "Score not found" });
       }
 

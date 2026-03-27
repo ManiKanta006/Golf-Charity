@@ -1,5 +1,5 @@
 import express from "express";
-import { query } from "../db.js";
+import supabase from "../supabaseClient.js";
 import { requireAuth } from "../middleware/auth.js";
 
 const router = express.Router();
@@ -63,20 +63,28 @@ async function callCashfree(path, { method = "GET", body } = {}) {
 }
 
 async function activateSubscription({ userId, plan, charityPercentage, charityId = null }) {
-  await query(
-    `INSERT INTO subscriptions
-      (user_id, plan, status, amount, renewal_date, charity_percentage)
-     VALUES (?, ?, 'active', ?, ?, ?)`,
-    [userId, plan, planAmount(plan), nextRenewalDate(plan), charityPercentage]
-  );
+  const { error: subErr } = await supabase
+    .from("subscriptions")
+    .insert({
+      user_id: userId,
+      plan,
+      status: "active",
+      amount: planAmount(plan),
+      renewal_date: nextRenewalDate(plan).toISOString().split("T")[0],
+      charity_percentage: charityPercentage
+    });
+
+  if (subErr) throw subErr;
 
   if (charityId) {
-    await query(
-      `INSERT INTO user_charity_preferences (user_id, charity_id)
-       VALUES (?, ?)
-       ON DUPLICATE KEY UPDATE charity_id = VALUES(charity_id)`,
-      [userId, charityId]
-    );
+    const { error: prefErr } = await supabase
+      .from("user_charity_preferences")
+      .upsert(
+        { user_id: userId, charity_id: charityId },
+        { onConflict: "user_id" }
+      );
+
+    if (prefErr) throw prefErr;
   }
 }
 
@@ -109,13 +117,13 @@ router.post("/checkout-session", requireAuth, async (req, res, next) => {
       return res.status(503).json({ message: "Cashfree is not configured" });
     }
 
-    const [userRow] = await query(
-      `SELECT name, email
-       FROM users
-       WHERE id = ?
-       LIMIT 1`,
-      [req.user.userId]
-    );
+    const { data: userRow, error: uErr } = await supabase
+      .from("users")
+      .select("name, email")
+      .eq("id", req.user.userId)
+      .maybeSingle();
+
+    if (uErr) throw uErr;
 
     const orderId = `sub_${req.user.userId}_${Date.now()}`;
     const order = await callCashfree("/orders", {

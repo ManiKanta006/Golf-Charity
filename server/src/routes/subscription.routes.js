@@ -1,5 +1,5 @@
 import express from "express";
-import { query } from "../db.js";
+import supabase from "../supabaseClient.js";
 import { requireAuth } from "../middleware/auth.js";
 import { getLatestSubscriptionWithLifecycle } from "../utils/subscription.js";
 
@@ -30,16 +30,25 @@ router.post("/me", requireAuth, async (req, res, next) => {
 
 router.patch("/me/cancel", requireAuth, async (req, res, next) => {
   try {
-    const rows = await query(
-      `SELECT id FROM subscriptions WHERE user_id = ? ORDER BY id DESC LIMIT 1`,
-      [req.user.userId]
-    );
+    const { data: rows, error } = await supabase
+      .from("subscriptions")
+      .select("id")
+      .eq("user_id", req.user.userId)
+      .order("id", { ascending: false })
+      .limit(1);
 
-    if (!rows.length) {
+    if (error) throw error;
+
+    if (!rows || !rows.length) {
       return res.status(404).json({ message: "Subscription not found" });
     }
 
-    await query("UPDATE subscriptions SET status = 'cancelled' WHERE id = ?", [rows[0].id]);
+    const { error: updErr } = await supabase
+      .from("subscriptions")
+      .update({ status: "cancelled" })
+      .eq("id", rows[0].id);
+
+    if (updErr) throw updErr;
     return res.json({ message: "Subscription cancelled" });
   } catch (error) {
     return next(error);
@@ -65,16 +74,16 @@ router.patch("/me/charity-percentage", requireAuth, async (req, res, next) => {
         .json({ message: "Charity percentage must be a number between 10 and 90" });
     }
 
-    const rows = await query(
-      `SELECT id, charity_percentage
-       FROM subscriptions
-       WHERE user_id = ?
-       ORDER BY id DESC
-       LIMIT 1`,
-      [req.user.userId]
-    );
+    const { data: rows, error } = await supabase
+      .from("subscriptions")
+      .select("id, charity_percentage")
+      .eq("user_id", req.user.userId)
+      .order("id", { ascending: false })
+      .limit(1);
 
-    if (!rows.length) {
+    if (error) throw error;
+
+    if (!rows || !rows.length) {
       return res.status(404).json({ message: "Subscription not found" });
     }
 
@@ -85,11 +94,12 @@ router.patch("/me/charity-percentage", requireAuth, async (req, res, next) => {
       });
     }
 
-    await query("UPDATE subscriptions SET charity_percentage = ? WHERE id = ?", [
-      percentage,
-      latest.id
-    ]);
+    const { error: updErr } = await supabase
+      .from("subscriptions")
+      .update({ charity_percentage: percentage })
+      .eq("id", latest.id);
 
+    if (updErr) throw updErr;
     return res.json({ message: "Charity percentage updated" });
   } catch (error) {
     return next(error);

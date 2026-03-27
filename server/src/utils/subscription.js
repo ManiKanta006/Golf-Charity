@@ -1,16 +1,16 @@
-import { query } from "../db.js";
+import supabase from "../supabaseClient.js";
 
 export async function getLatestSubscription(userId) {
-  const rows = await query(
-    `SELECT id, plan, status, amount, renewal_date, charity_percentage, created_at
-     FROM subscriptions
-     WHERE user_id = ?
-     ORDER BY id DESC
-     LIMIT 1`,
-    [userId]
-  );
+  const { data, error } = await supabase
+    .from("subscriptions")
+    .select("id, plan, status, amount, renewal_date, charity_percentage, created_at")
+    .eq("user_id", userId)
+    .order("id", { ascending: false })
+    .limit(1)
+    .maybeSingle();
 
-  return rows[0] || null;
+  if (error) throw error;
+  return data || null;
 }
 
 export function normalizeSubscriptionStatus(subscription) {
@@ -38,7 +38,11 @@ export async function getLatestSubscriptionWithLifecycle(userId) {
 
   const normalized = normalizeSubscriptionStatus(current);
   if (normalized.status !== current.status) {
-    await query("UPDATE subscriptions SET status = ? WHERE id = ?", [normalized.status, current.id]);
+    const { error } = await supabase
+      .from("subscriptions")
+      .update({ status: normalized.status })
+      .eq("id", current.id);
+    if (error) throw error;
   }
 
   return normalized;

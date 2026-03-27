@@ -1,7 +1,7 @@
 import express from "express";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
-import { query } from "../db.js";
+import supabase from "../supabaseClient.js";
 import { requireAuth } from "../middleware/auth.js";
 
 const router = express.Router();
@@ -27,24 +27,34 @@ router.post("/register", async (req, res, next) => {
       return res.status(400).json({ message: "Name, email and password are required" });
     }
 
-    const existing = await query("SELECT id FROM users WHERE email = ?", [email]);
-    if (existing.length > 0) {
+    const { data: existing, error: lookupErr } = await supabase
+      .from("users")
+      .select("id")
+      .eq("email", email)
+      .limit(1);
+
+    if (lookupErr) throw lookupErr;
+
+    if (existing && existing.length > 0) {
       return res.status(409).json({ message: "Email already in use" });
     }
 
     const hash = await bcrypt.hash(password, 10);
-    const result = await query(
-      "INSERT INTO users (name, email, password_hash, role) VALUES (?, ?, ?, 'subscriber')",
-      [name, email, hash]
-    );
+    const { data: newUser, error: insertErr } = await supabase
+      .from("users")
+      .insert({ name, email, password_hash: hash, role: "subscriber" })
+      .select("id")
+      .single();
 
-    const userId = result.insertId;
+    if (insertErr) throw insertErr;
+
+    const userId = newUser.id;
 
     if (charityId) {
-      await query(
-        "INSERT INTO user_charity_preferences (user_id, charity_id) VALUES (?, ?)",
-        [userId, charityId]
-      );
+      const { error: prefErr } = await supabase
+        .from("user_charity_preferences")
+        .insert({ user_id: userId, charity_id: charityId });
+      if (prefErr) throw prefErr;
     }
 
     const token = signToken({ id: userId, email, role: "subscriber" });
@@ -61,12 +71,15 @@ router.post("/login", async (req, res, next) => {
       return res.status(400).json({ message: "Email and password are required" });
     }
 
-    const rows = await query(
-      "SELECT id, name, email, role, password_hash FROM users WHERE email = ? LIMIT 1",
-      [email]
-    );
+    const { data: rows, error } = await supabase
+      .from("users")
+      .select("id, name, email, role, password_hash")
+      .eq("email", email)
+      .limit(1);
 
-    if (rows.length === 0) {
+    if (error) throw error;
+
+    if (!rows || rows.length === 0) {
       return res.status(401).json({ message: "Invalid credentials" });
     }
 
@@ -88,11 +101,18 @@ router.post("/login", async (req, res, next) => {
 
 router.get("/me", requireAuth, async (req, res, next) => {
   try {
-    const rows = await query("SELECT id, name, email, role FROM users WHERE id = ?", [req.user.userId]);
-    if (!rows.length) {
+    const { data, error } = await supabase
+      .from("users")
+      .select("id, name, email, role")
+      .eq("id", req.user.userId)
+      .maybeSingle();
+
+    if (error) throw error;
+
+    if (!data) {
       return res.status(404).json({ message: "User not found" });
     }
-    return res.json(rows[0]);
+    return res.json(data);
   } catch (error) {
     return next(error);
   }

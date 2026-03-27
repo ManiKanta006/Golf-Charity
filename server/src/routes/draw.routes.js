@@ -3,7 +3,7 @@ import fs from "fs";
 import path from "path";
 import multer from "multer";
 import { fileURLToPath } from "url";
-import { query } from "../db.js";
+import supabase from "../supabaseClient.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
 import {
   randomDrawNumbers,
@@ -33,40 +33,69 @@ const upload = multer({
 });
 
 async function getActiveUsersWithNumbers() {
-  // Keep SQL compatible with older MySQL variants by avoiding JSON aggregation
-  // ordering and window functions.
-  const activeUsers = await query(
-    `SELECT u.id AS user_id, u.name,
-            COALESCE((
-              SELECT COUNT(*)
-              FROM draw_entries de
-              WHERE de.user_id = u.id AND de.match_count >= 3
-            ), 0) AS historical_wins
-     FROM users u
-     JOIN subscriptions sub ON sub.user_id = u.id
-     WHERE sub.id = (
-       SELECT s2.id FROM subscriptions s2 WHERE s2.user_id = u.id ORDER BY s2.id DESC LIMIT 1
-     )
-       AND sub.status = 'active'`
-  );
+  // 1. Get active subscribers via the latest_user_subscriptions view
+  const { data: activeSubs, error: asErr } = await supabase
+    .from("latest_user_subscriptions")
+    .select("user_id")
+    .eq("status", "active");
+
+  if (asErr) throw asErr;
+  if (!activeSubs || !activeSubs.length) return [];
+
+  const activeUserIds = activeSubs.map((s) => s.user_id);
+
+  // 2. Get user details
+  const { data: users, error: uErr } = await supabase
+    .from("users")
+    .select("id, name")
+    .in("id", activeUserIds);
+
+  if (uErr) throw uErr;
+
+  // 3. Get historical wins (match_count >= 3) for all active users
+  const { data: winEntries, error: wErr } = await supabase
+    .from("draw_entries")
+    .select("user_id")
+    .in("user_id", activeUserIds)
+    .gte("match_count", 3);
+
+  if (wErr) throw wErr;
+
+  const winCounts = new Map();
+  for (const entry of winEntries || []) {
+    winCounts.set(entry.user_id, (winCounts.get(entry.user_id) || 0) + 1);
+  }
+
+  // 4. Get all scores for active users (batch, not N+1)
+  const { data: allUserScores, error: sErr } = await supabase
+    .from("scores")
+    .select("user_id, score, date_played, created_at")
+    .in("user_id", activeUserIds)
+    .order("date_played", { ascending: false })
+    .order("created_at", { ascending: false });
+
+  if (sErr) throw sErr;
+
+  // Group scores by user_id, keep latest 5 per user
+  const scoresByUser = new Map();
+  for (const sc of allUserScores || []) {
+    if (!scoresByUser.has(sc.user_id)) {
+      scoresByUser.set(sc.user_id, []);
+    }
+    const arr = scoresByUser.get(sc.user_id);
+    if (arr.length < 5) {
+      arr.push(sc);
+    }
+  }
 
   const usersWithNumbers = [];
-
-  for (const user of activeUsers) {
-    const scores = await query(
-      `SELECT score
-       FROM scores
-       WHERE user_id = ?
-       ORDER BY date_played DESC, created_at DESC
-       LIMIT 5`,
-      [user.user_id]
-    );
-
+  for (const user of users || []) {
+    const scores = scoresByUser.get(user.id) || [];
     if (scores.length === 5) {
       usersWithNumbers.push({
-        user_id: user.user_id,
+        user_id: user.id,
         name: user.name,
-        historical_wins: Number(user.historical_wins || 0),
+        historical_wins: winCounts.get(user.id) || 0,
         numbers_json: JSON.stringify(scores.map((row) => Number(row.score)))
       });
     }
@@ -76,22 +105,25 @@ async function getActiveUsersWithNumbers() {
 }
 
 async function getPrizePool() {
-  const [row] = await query(
-    `SELECT COALESCE(SUM(amount * 0.3), 0) AS totalPrizePool
-     FROM subscriptions
-     WHERE status = 'active'`
-  );
-  return Number(row.totalPrizePool || 0);
+  const { data, error } = await supabase
+    .from("subscriptions")
+    .select("amount")
+    .eq("status", "active");
+
+  if (error) throw error;
+  return (data || []).reduce((sum, s) => sum + Number(s.amount) * 0.3, 0);
 }
 
 async function getCurrentCarryover() {
-  const [row] = await query(
-    `SELECT jackpot_carryover
-     FROM draws
-     ORDER BY id DESC
-     LIMIT 1`
-  );
-  return Number(row?.jackpot_carryover || 0);
+  const { data, error } = await supabase
+    .from("draws")
+    .select("jackpot_carryover")
+    .order("id", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) throw error;
+  return Number(data?.jackpot_carryover || 0);
 }
 
 function chooseWinningNumbers(mode, allScores) {
@@ -168,19 +200,27 @@ function toNumberArray(value) {
 }
 
 async function notifyDrawPublished(drawId, preview) {
-  const rows = await query(
-    `SELECT DISTINCT u.email
-     FROM users u
-     JOIN subscriptions sub ON sub.user_id = u.id
-     WHERE sub.id = (
-       SELECT s2.id FROM subscriptions s2 WHERE s2.user_id = u.id ORDER BY s2.id DESC LIMIT 1
-     )
-       AND sub.status = 'active'`
-  );
+  // Get emails of active subscribers via the view
+  const { data: activeSubs, error: asErr } = await supabase
+    .from("latest_user_subscriptions")
+    .select("user_id")
+    .eq("status", "active");
+
+  if (asErr) throw asErr;
+  if (!activeSubs || !activeSubs.length) return;
+
+  const userIds = activeSubs.map((s) => s.user_id);
+
+  const { data: users, error: uErr } = await supabase
+    .from("users")
+    .select("email")
+    .in("id", userIds);
+
+  if (uErr) throw uErr;
 
   const winningNumbers = preview.winningNumbers.join(", ");
   await sendBulkNotification(
-    rows.map((r) => r.email),
+    (users || []).map((r) => r.email),
     () => ({
       subject: `Monthly Draw Published (Draw #${drawId})`,
       text: `The monthly draw is now live. Winning numbers: ${winningNumbers}. Log in to view results and winner status.`
@@ -190,19 +230,21 @@ async function notifyDrawPublished(drawId, preview) {
 
 router.get("/latest", async (_req, res, next) => {
   try {
-    const rows = await query(
-      `SELECT id, draw_month, draw_mode, winning_numbers, published, jackpot_carryover, created_at, published_at
-       FROM draws
-       WHERE published = 1
-       ORDER BY id DESC
-       LIMIT 1`
-    );
+    const { data: draw, error } = await supabase
+      .from("draws")
+      .select("id, draw_month, draw_mode, winning_numbers, published, jackpot_carryover, created_at, published_at")
+      .eq("published", true)
+      .order("id", { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
-    if (!rows.length) {
+    if (error) throw error;
+
+    if (!draw) {
       return res.json(null);
     }
 
-    const draw = rows[0];
+    // JSONB is returned as native array by Supabase, but toNumberArray handles both
     draw.winning_numbers = toNumberArray(draw.winning_numbers);
     return res.json(draw);
   } catch (error) {
@@ -212,19 +254,26 @@ router.get("/latest", async (_req, res, next) => {
 
 router.get("/entries/admin", requireAuth, requireAdmin, async (_req, res, next) => {
   try {
-    const rows = await query(
-      `SELECT de.id, de.draw_id, de.user_id, de.match_count, de.prize_amount,
-              de.proof_url, de.verification_status, de.payment_status, de.created_at,
-              u.name AS user_name, u.email AS user_email,
-              d.draw_month, d.draw_mode
-       FROM draw_entries de
-       JOIN users u ON u.id = de.user_id
-       JOIN draws d ON d.id = de.draw_id
-       WHERE de.match_count >= 3
-       ORDER BY de.created_at DESC`
-    );
+    const { data: rows, error } = await supabase
+      .from("draw_entries")
+      .select(
+        "id, draw_id, user_id, match_count, prize_amount, proof_url, verification_status, payment_status, created_at, users(name, email), draws(draw_month, draw_mode)"
+      )
+      .gte("match_count", 3)
+      .order("created_at", { ascending: false });
 
-    return res.json(rows);
+    if (error) throw error;
+
+    // Flatten nested relation objects to match original response format
+    const flattened = (rows || []).map(({ users, draws, ...rest }) => ({
+      ...rest,
+      user_name: users?.name || null,
+      user_email: users?.email || null,
+      draw_month: draws?.draw_month || null,
+      draw_mode: draws?.draw_mode || null
+    }));
+
+    return res.json(flattened);
   } catch (error) {
     return next(error);
   }
@@ -232,18 +281,24 @@ router.get("/entries/admin", requireAuth, requireAdmin, async (_req, res, next) 
 
 router.get("/entries/me", requireAuth, async (req, res, next) => {
   try {
-    const rows = await query(
-      `SELECT de.id, de.draw_id, de.match_count, de.prize_amount,
-              de.proof_url, de.verification_status, de.payment_status, de.created_at,
-              d.draw_month, d.draw_mode
-       FROM draw_entries de
-       JOIN draws d ON d.id = de.draw_id
-       WHERE de.user_id = ? AND de.match_count >= 3
-       ORDER BY de.created_at DESC`,
-      [req.user.userId]
-    );
+    const { data: rows, error } = await supabase
+      .from("draw_entries")
+      .select(
+        "id, draw_id, match_count, prize_amount, proof_url, verification_status, payment_status, created_at, draws(draw_month, draw_mode)"
+      )
+      .eq("user_id", req.user.userId)
+      .gte("match_count", 3)
+      .order("created_at", { ascending: false });
 
-    return res.json(rows);
+    if (error) throw error;
+
+    const flattened = (rows || []).map(({ draws, ...rest }) => ({
+      ...rest,
+      draw_month: draws?.draw_month || null,
+      draw_mode: draws?.draw_mode || null
+    }));
+
+    return res.json(flattened);
   } catch (error) {
     return next(error);
   }
@@ -252,13 +307,18 @@ router.get("/entries/me", requireAuth, async (req, res, next) => {
 router.post("/simulate", requireAuth, requireAdmin, async (req, res, next) => {
   try {
     const mode = req.body.mode === "algorithmic" ? "algorithmic" : "random";
-    const allScores = await query("SELECT score FROM scores");
+
+    const { data: allScores, error: sErr } = await supabase
+      .from("scores")
+      .select("score");
+    if (sErr) throw sErr;
+
     const users = await getActiveUsersWithNumbers();
     const totalPrizePool = await getPrizePool();
     const carryover = await getCurrentCarryover();
-    let winningNumbers = chooseWinningNumbers(mode, allScores);
+    let winningNumbers = chooseWinningNumbers(mode, allScores || []);
     if (mode === "algorithmic") {
-      winningNumbers = boostedAlgorithmicNumbers(winningNumbers, users, allScores);
+      winningNumbers = boostedAlgorithmicNumbers(winningNumbers, users, allScores || []);
     }
 
     const preview = buildDrawPreview({ users, winningNumbers, totalPrizePool, carryover });
@@ -278,13 +338,18 @@ router.post("/simulate", requireAuth, requireAdmin, async (req, res, next) => {
 router.post("/publish", requireAuth, requireAdmin, async (req, res, next) => {
   try {
     const mode = req.body.mode === "algorithmic" ? "algorithmic" : "random";
-    const allScores = await query("SELECT score FROM scores");
+
+    const { data: allScores, error: sErr } = await supabase
+      .from("scores")
+      .select("score");
+    if (sErr) throw sErr;
+
     const users = await getActiveUsersWithNumbers();
     const totalPrizePool = await getPrizePool();
     const carryover = await getCurrentCarryover();
-    let winningNumbers = chooseWinningNumbers(mode, allScores);
+    let winningNumbers = chooseWinningNumbers(mode, allScores || []);
     if (mode === "algorithmic") {
-      winningNumbers = boostedAlgorithmicNumbers(winningNumbers, users, allScores);
+      winningNumbers = boostedAlgorithmicNumbers(winningNumbers, users, allScores || []);
     }
 
     const preview = buildDrawPreview({ users, winningNumbers, totalPrizePool, carryover });
@@ -292,14 +357,17 @@ router.post("/publish", requireAuth, requireAdmin, async (req, res, next) => {
     const now = new Date();
     const drawMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-01`;
 
-    const [existingMonthDraw] = await query(
-      `SELECT id
-       FROM draws
-       WHERE draw_month = ? AND published = 1
-       ORDER BY id DESC
-       LIMIT 1`,
-      [drawMonth]
-    );
+    // Check if a draw was already published this month
+    const { data: existingMonthDraw, error: emErr } = await supabase
+      .from("draws")
+      .select("id")
+      .eq("draw_month", drawMonth)
+      .eq("published", true)
+      .order("id", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (emErr) throw emErr;
 
     if (existingMonthDraw) {
       return res.status(409).json({
@@ -307,15 +375,26 @@ router.post("/publish", requireAuth, requireAdmin, async (req, res, next) => {
       });
     }
 
-    const drawInsert = await query(
-      `INSERT INTO draws (draw_month, draw_mode, winning_numbers, published, jackpot_carryover, published_at)
-       VALUES (?, ?, ?, 1, ?, NOW())`,
-      [drawMonth, mode, JSON.stringify(winningNumbers), preview.nextCarryover]
-    );
+    // Insert the draw — JSONB columns accept native arrays directly
+    const { data: drawRow, error: diErr } = await supabase
+      .from("draws")
+      .insert({
+        draw_month: drawMonth,
+        draw_mode: mode,
+        winning_numbers: winningNumbers,
+        published: true,
+        jackpot_carryover: preview.nextCarryover,
+        published_at: new Date().toISOString()
+      })
+      .select("id")
+      .single();
 
-    const drawId = drawInsert.insertId;
+    if (diErr) throw diErr;
 
-    for (const user of users) {
+    const drawId = drawRow.id;
+
+    // Insert draw entries for all participants
+    const entries = users.map((user) => {
       const numbers = toNumberArray(user.numbers_json);
       const winnerByTier =
         preview.tierWinners[5].find((w) => w.userId === user.user_id) ||
@@ -329,12 +408,20 @@ router.post("/publish", requireAuth, requireAdmin, async (req, res, next) => {
         prize = tier?.perWinner || 0;
       }
 
-      await query(
-        `INSERT INTO draw_entries
-          (draw_id, user_id, numbers, match_count, prize_amount, verification_status, payment_status)
-         VALUES (?, ?, ?, ?, ?, 'pending', 'pending')`,
-        [drawId, user.user_id, JSON.stringify(numbers), matches, prize]
-      );
+      return {
+        draw_id: drawId,
+        user_id: user.user_id,
+        numbers,
+        match_count: matches,
+        prize_amount: prize,
+        verification_status: "pending",
+        payment_status: "pending"
+      };
+    });
+
+    if (entries.length) {
+      const { error: beErr } = await supabase.from("draw_entries").insert(entries);
+      if (beErr) throw beErr;
     }
 
     await notifyDrawPublished(drawId, preview);
@@ -361,15 +448,16 @@ router.patch("/entries/:entryId/proof", requireAuth, upload.single("proofFile"),
       return res.status(400).json({ message: "Proof URL or file is required" });
     }
 
-    const currentRows = await query(
-      `SELECT verification_status, payment_status
-       FROM draw_entries
-       WHERE id = ? AND user_id = ?
-       LIMIT 1`,
-      [req.params.entryId, req.user.userId]
-    );
+    const { data: currentRows, error: crErr } = await supabase
+      .from("draw_entries")
+      .select("verification_status, payment_status")
+      .eq("id", req.params.entryId)
+      .eq("user_id", req.user.userId)
+      .limit(1);
 
-    if (!currentRows.length) {
+    if (crErr) throw crErr;
+
+    if (!currentRows || !currentRows.length) {
       return res.status(404).json({ message: "Entry not found" });
     }
 
@@ -382,14 +470,16 @@ router.patch("/entries/:entryId/proof", requireAuth, upload.single("proofFile"),
       });
     }
 
-    const result = await query(
-      `UPDATE draw_entries
-       SET proof_url = ?, verification_status = 'pending'
-       WHERE id = ? AND user_id = ?`,
-      [finalProofUrl, req.params.entryId, req.user.userId]
-    );
+    const { data, error } = await supabase
+      .from("draw_entries")
+      .update({ proof_url: finalProofUrl, verification_status: "pending" })
+      .eq("id", req.params.entryId)
+      .eq("user_id", req.user.userId)
+      .select();
 
-    if (result.affectedRows === 0) {
+    if (error) throw error;
+
+    if (!data || data.length === 0) {
       return res.status(404).json({ message: "Entry not found" });
     }
 
@@ -402,31 +492,34 @@ router.patch("/entries/:entryId/proof", requireAuth, upload.single("proofFile"),
 router.patch("/entries/:entryId/verify", requireAuth, requireAdmin, async (req, res, next) => {
   try {
     const status = req.body.status === "approved" ? "approved" : "rejected";
-    const result = await query(
-      `UPDATE draw_entries
-       SET verification_status = ?
-       WHERE id = ?`,
-      [status, req.params.entryId]
-    );
 
-    if (result.affectedRows === 0) {
+    const { data, error } = await supabase
+      .from("draw_entries")
+      .update({ verification_status: status })
+      .eq("id", req.params.entryId)
+      .select();
+
+    if (error) throw error;
+
+    if (!data || data.length === 0) {
       return res.status(404).json({ message: "Entry not found" });
     }
 
-    const [entryRow] = await query(
-      `SELECT u.email, u.name, de.match_count, de.prize_amount
-       FROM draw_entries de
-       JOIN users u ON u.id = de.user_id
-       WHERE de.id = ?
-       LIMIT 1`,
-      [req.params.entryId]
-    );
+    // Get user info for notification via relation
+    const { data: entryRow, error: eErr } = await supabase
+      .from("draw_entries")
+      .select("match_count, prize_amount, users(email, name)")
+      .eq("id", req.params.entryId)
+      .limit(1)
+      .maybeSingle();
 
-    if (entryRow?.email) {
+    if (eErr) throw eErr;
+
+    if (entryRow?.users?.email) {
       await sendNotificationEmail({
-        to: entryRow.email,
+        to: entryRow.users.email,
         subject: `Winner Submission ${status === "approved" ? "Approved" : "Rejected"}`,
-        text: `Hello ${entryRow.name}, your ${entryRow.match_count}-match submission was ${status}. Current prize amount: $${Number(entryRow.prize_amount || 0).toFixed(2)}.`
+        text: `Hello ${entryRow.users.name}, your ${entryRow.match_count}-match submission was ${status}. Current prize amount: $${Number(entryRow.prize_amount || 0).toFixed(2)}.`
       });
     }
 
@@ -438,31 +531,34 @@ router.patch("/entries/:entryId/verify", requireAuth, requireAdmin, async (req, 
 
 router.patch("/entries/:entryId/pay", requireAuth, requireAdmin, async (req, res, next) => {
   try {
-    const result = await query(
-      `UPDATE draw_entries
-       SET payment_status = 'paid'
-       WHERE id = ? AND verification_status = 'approved'`,
-      [req.params.entryId]
-    );
+    const { data, error } = await supabase
+      .from("draw_entries")
+      .update({ payment_status: "paid" })
+      .eq("id", req.params.entryId)
+      .eq("verification_status", "approved")
+      .select();
 
-    if (result.affectedRows === 0) {
+    if (error) throw error;
+
+    if (!data || data.length === 0) {
       return res.status(400).json({ message: "Entry must be approved before payout" });
     }
 
-    const [entryRow] = await query(
-      `SELECT u.email, u.name, de.match_count, de.prize_amount
-       FROM draw_entries de
-       JOIN users u ON u.id = de.user_id
-       WHERE de.id = ?
-       LIMIT 1`,
-      [req.params.entryId]
-    );
+    // Get user info for notification via relation
+    const { data: entryRow, error: eErr } = await supabase
+      .from("draw_entries")
+      .select("match_count, prize_amount, users(email, name)")
+      .eq("id", req.params.entryId)
+      .limit(1)
+      .maybeSingle();
 
-    if (entryRow?.email) {
+    if (eErr) throw eErr;
+
+    if (entryRow?.users?.email) {
       await sendNotificationEmail({
-        to: entryRow.email,
+        to: entryRow.users.email,
         subject: "Payout Completed",
-        text: `Hello ${entryRow.name}, your payout for ${entryRow.match_count}-match has been marked as paid. Amount: $${Number(entryRow.prize_amount || 0).toFixed(2)}.`
+        text: `Hello ${entryRow.users.name}, your payout for ${entryRow.match_count}-match has been marked as paid. Amount: $${Number(entryRow.prize_amount || 0).toFixed(2)}.`
       });
     }
 

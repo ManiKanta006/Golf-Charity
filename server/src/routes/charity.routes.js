@@ -1,5 +1,5 @@
 import express from "express";
-import { query } from "../db.js";
+import supabase from "../supabaseClient.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
 
 const router = express.Router();
@@ -52,17 +52,21 @@ const charityEventsByName = {
 router.get("/", async (req, res, next) => {
   try {
     const search = req.query.search?.trim();
-    let sql = `SELECT id, name, description, image_url, featured, active FROM charities WHERE active = 1`;
-    const params = [];
+    let qb = supabase
+      .from("charities")
+      .select("id, name, description, image_url, featured, active")
+      .eq("active", true);
 
     if (search) {
-      sql += " AND (name LIKE ? OR description LIKE ?)";
-      params.push(`%${search}%`, `%${search}%`);
+      qb = qb.or(`name.ilike.%${search}%,description.ilike.%${search}%`);
     }
 
-    sql += " ORDER BY featured DESC, name ASC";
-    const rows = await query(sql, params);
-    return res.json(rows);
+    const { data: rows, error } = await qb
+      .order("featured", { ascending: false })
+      .order("name", { ascending: true });
+
+    if (error) throw error;
+    return res.json(rows || []);
   } catch (error) {
     return next(error);
   }
@@ -70,14 +74,17 @@ router.get("/", async (req, res, next) => {
 
 router.get("/featured", async (_req, res, next) => {
   try {
-    const rows = await query(
-      `SELECT id, name, description, image_url
-       FROM charities
-       WHERE active = 1 AND featured = 1
-       ORDER BY id DESC
-       LIMIT 1`
-    );
-    return res.json(rows[0] || null);
+    const { data, error } = await supabase
+      .from("charities")
+      .select("id, name, description, image_url")
+      .eq("active", true)
+      .eq("featured", true)
+      .order("id", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (error) throw error;
+    return res.json(data || null);
   } catch (error) {
     return next(error);
   }
@@ -85,19 +92,19 @@ router.get("/featured", async (_req, res, next) => {
 
 router.get("/:id", async (req, res, next) => {
   try {
-    const rows = await query(
-      `SELECT id, name, description, image_url, featured, active
-       FROM charities
-       WHERE id = ? AND active = 1
-       LIMIT 1`,
-      [req.params.id]
-    );
+    const { data: charity, error } = await supabase
+      .from("charities")
+      .select("id, name, description, image_url, featured, active")
+      .eq("id", req.params.id)
+      .eq("active", true)
+      .maybeSingle();
 
-    if (!rows.length) {
+    if (error) throw error;
+
+    if (!charity) {
       return res.status(404).json({ message: "Charity not found" });
     }
 
-    const charity = rows[0];
     const events = charityEventsByName[charity.name] || [];
     const gallery = [
       charity.image_url,
@@ -127,18 +134,27 @@ router.patch("/selection/me", requireAuth, async (req, res, next) => {
       return res.status(400).json({ message: "Charity is required" });
     }
 
-    const charityRows = await query("SELECT id FROM charities WHERE id = ? AND active = 1", [charityId]);
-    if (!charityRows.length) {
+    const { data: charityRows, error: cErr } = await supabase
+      .from("charities")
+      .select("id")
+      .eq("id", charityId)
+      .eq("active", true)
+      .limit(1);
+
+    if (cErr) throw cErr;
+
+    if (!charityRows || !charityRows.length) {
       return res.status(404).json({ message: "Charity not found" });
     }
 
-    await query(
-      `INSERT INTO user_charity_preferences (user_id, charity_id)
-       VALUES (?, ?)
-       ON DUPLICATE KEY UPDATE charity_id = VALUES(charity_id)`,
-      [req.user.userId, charityId]
-    );
+    const { error: upsertErr } = await supabase
+      .from("user_charity_preferences")
+      .upsert(
+        { user_id: req.user.userId, charity_id: charityId },
+        { onConflict: "user_id" }
+      );
 
+    if (upsertErr) throw upsertErr;
     return res.json({ message: "Charity preference updated" });
   } catch (error) {
     return next(error);
@@ -147,17 +163,22 @@ router.patch("/selection/me", requireAuth, async (req, res, next) => {
 
 router.post("/", requireAuth, requireAdmin, async (req, res, next) => {
   try {
-    const { name, description, imageUrl = null, featured = 0 } = req.body;
+    const { name, description, imageUrl = null, featured = false } = req.body;
     if (!name || !description) {
       return res.status(400).json({ message: "Name and description are required" });
     }
 
-    await query(
-      `INSERT INTO charities (name, description, image_url, featured, active)
-       VALUES (?, ?, ?, ?, 1)`,
-      [name, description, imageUrl, Number(featured) ? 1 : 0]
-    );
+    const { error } = await supabase
+      .from("charities")
+      .insert({
+        name,
+        description,
+        image_url: imageUrl,
+        featured: Boolean(Number(featured)),
+        active: true
+      });
 
+    if (error) throw error;
     return res.status(201).json({ message: "Charity added" });
   } catch (error) {
     return next(error);
@@ -166,15 +187,23 @@ router.post("/", requireAuth, requireAdmin, async (req, res, next) => {
 
 router.put("/:id", requireAuth, requireAdmin, async (req, res, next) => {
   try {
-    const { name, description, imageUrl = null, featured = 0, active = 1 } = req.body;
-    const result = await query(
-      `UPDATE charities
-       SET name = ?, description = ?, image_url = ?, featured = ?, active = ?
-       WHERE id = ?`,
-      [name, description, imageUrl, Number(featured) ? 1 : 0, Number(active) ? 1 : 0, req.params.id]
-    );
+    const { name, description, imageUrl = null, featured = false, active = true } = req.body;
 
-    if (result.affectedRows === 0) {
+    const { data, error } = await supabase
+      .from("charities")
+      .update({
+        name,
+        description,
+        image_url: imageUrl,
+        featured: Boolean(Number(featured)),
+        active: Boolean(Number(active))
+      })
+      .eq("id", req.params.id)
+      .select();
+
+    if (error) throw error;
+
+    if (!data || data.length === 0) {
       return res.status(404).json({ message: "Charity not found" });
     }
 
@@ -186,8 +215,15 @@ router.put("/:id", requireAuth, requireAdmin, async (req, res, next) => {
 
 router.delete("/:id", requireAuth, requireAdmin, async (req, res, next) => {
   try {
-    const result = await query("UPDATE charities SET active = 0 WHERE id = ?", [req.params.id]);
-    if (result.affectedRows === 0) {
+    const { data, error } = await supabase
+      .from("charities")
+      .update({ active: false })
+      .eq("id", req.params.id)
+      .select();
+
+    if (error) throw error;
+
+    if (!data || data.length === 0) {
       return res.status(404).json({ message: "Charity not found" });
     }
     return res.json({ message: "Charity archived" });

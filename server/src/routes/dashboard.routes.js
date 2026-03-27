@@ -1,5 +1,5 @@
 import express from "express";
-import { query } from "../db.js";
+import supabase from "../supabaseClient.js";
 import { requireAuth, requireAdmin } from "../middleware/auth.js";
 import { getLatestSubscriptionWithLifecycle } from "../utils/subscription.js";
 
@@ -11,51 +11,69 @@ router.get("/me", requireAuth, async (req, res, next) => {
 
     const subscription = await getLatestSubscriptionWithLifecycle(userId);
 
-    const scores = await query(
-      `SELECT id, score, date_played
-       FROM scores
-       WHERE user_id = ?
-       ORDER BY date_played DESC, created_at DESC`,
-      [userId]
-    );
+    const { data: scores, error: scErr } = await supabase
+      .from("scores")
+      .select("id, score, date_played")
+      .eq("user_id", userId)
+      .order("date_played", { ascending: false })
+      .order("created_at", { ascending: false });
 
-    const [selectedCharity] = await query(
-      `SELECT c.id, c.name, c.description, c.image_url
-       FROM user_charity_preferences ucp
-       JOIN charities c ON c.id = ucp.charity_id
-       WHERE ucp.user_id = ? AND c.active = 1
-       LIMIT 1`,
-      [userId]
-    );
+    if (scErr) throw scErr;
 
-    const [participation] = await query(
-      `SELECT COUNT(*) AS drawsEntered
-       FROM draw_entries
-       WHERE user_id = ?`,
-      [userId]
-    );
+    // Selected charity via foreign-key relation
+    const { data: charityPref, error: cpErr } = await supabase
+      .from("user_charity_preferences")
+      .select("charities!inner(id, name, description, image_url)")
+      .eq("user_id", userId)
+      .eq("charities.active", true)
+      .limit(1)
+      .maybeSingle();
+
+    if (cpErr) throw cpErr;
+    const selectedCharity = charityPref?.charities || null;
+
+    // Draw participation count
+    const { count: drawsEntered, error: partErr } = await supabase
+      .from("draw_entries")
+      .select("*", { count: "exact", head: true })
+      .eq("user_id", userId);
+
+    if (partErr) throw partErr;
 
     const now = new Date();
     const nextYear = now.getMonth() === 11 ? now.getFullYear() + 1 : now.getFullYear();
     const nextMonthIndex = (now.getMonth() + 1) % 12;
     const upcomingDrawMonth = `${nextYear}-${String(nextMonthIndex + 1).padStart(2, "0")}-01`;
 
-    const [winnings] = await query(
-      `SELECT COALESCE(SUM(prize_amount), 0) AS totalWon,
-              SUM(CASE WHEN payment_status = 'pending' THEN 1 ELSE 0 END) AS pendingPayouts,
-              SUM(CASE WHEN payment_status = 'paid' THEN 1 ELSE 0 END) AS paidPayouts
-       FROM draw_entries
-       WHERE user_id = ?`,
-      [userId]
-    );
+    // Winnings – fetch entries and compute in JS (avoids aggregate SQL)
+    const { data: winEntries, error: wErr } = await supabase
+      .from("draw_entries")
+      .select("prize_amount, payment_status")
+      .eq("user_id", userId);
 
-    const [independentDonations] = await query(
-      `SELECT COALESCE(SUM(amount), 0) AS totalIndependentDonated,
-              COUNT(*) AS donationsCount
-       FROM donations
-       WHERE user_id = ?`,
-      [userId]
-    );
+    if (wErr) throw wErr;
+
+    const winnings = {
+      totalWon: (winEntries || []).reduce((s, e) => s + Number(e.prize_amount || 0), 0),
+      pendingPayouts: (winEntries || []).filter((e) => e.payment_status === "pending").length,
+      paidPayouts: (winEntries || []).filter((e) => e.payment_status === "paid").length
+    };
+
+    // Independent donations
+    const { data: donationRows, error: dErr } = await supabase
+      .from("donations")
+      .select("amount")
+      .eq("user_id", userId);
+
+    if (dErr) throw dErr;
+
+    const independentDonations = {
+      totalIndependentDonated: (donationRows || []).reduce(
+        (s, d) => s + Number(d.amount || 0),
+        0
+      ),
+      donationsCount: (donationRows || []).length
+    };
 
     return res.json({
       subscription: subscription
@@ -67,17 +85,14 @@ router.get("/me", requireAuth, async (req, res, next) => {
             charity_percentage: subscription.charity_percentage
           }
         : null,
-      scores,
-      selectedCharity: selectedCharity || null,
+      scores: scores || [],
+      selectedCharity,
       participation: {
-        drawsEntered: participation?.drawsEntered || 0,
+        drawsEntered: drawsEntered || 0,
         upcomingDrawMonth
       },
-      winnings: winnings || { totalWon: 0, pendingPayouts: 0, paidPayouts: 0 },
-      independentDonations: independentDonations || {
-        totalIndependentDonated: 0,
-        donationsCount: 0
-      }
+      winnings,
+      independentDonations
     });
   } catch (error) {
     return next(error);
@@ -86,29 +101,61 @@ router.get("/me", requireAuth, async (req, res, next) => {
 
 router.get("/admin/summary", requireAuth, requireAdmin, async (_req, res, next) => {
   try {
-    const [users] = await query("SELECT COUNT(*) AS totalUsers FROM users");
-    const [prizePool] = await query(
-      `SELECT COALESCE(SUM(amount * 0.3), 0) AS totalPrizePool
-       FROM subscriptions
-       WHERE status = 'active'`
+    // Total users
+    const { count: totalUsers, error: uErr } = await supabase
+      .from("users")
+      .select("*", { count: "exact", head: true });
+    if (uErr) throw uErr;
+
+    // Active subscriptions (for prize pool + charity totals)
+    const { data: activeSubs, error: sErr } = await supabase
+      .from("subscriptions")
+      .select("amount, charity_percentage")
+      .eq("status", "active");
+    if (sErr) throw sErr;
+
+    const totalPrizePool = (activeSubs || []).reduce(
+      (s, sub) => s + Number(sub.amount) * 0.3,
+      0
     );
-    const [charityTotals] = await query(
-      `SELECT COALESCE(SUM(s.amount * (s.charity_percentage / 100)), 0) AS totalCharityContributions
-       FROM subscriptions s
-       WHERE s.status = 'active'`
-    );
-    const [drawStats] = await query(
-      `SELECT COUNT(*) AS totalDraws,
-              COALESCE(SUM(CASE WHEN published = 1 THEN 1 ELSE 0 END), 0) AS publishedDraws
-       FROM draws`
-    );
-    const [independentDonationStats] = await query(
-      `SELECT COALESCE(SUM(amount), 0) AS totalIndependentDonations,
-              COUNT(*) AS donationsCount
-       FROM donations`
+    const totalCharityContributions = (activeSubs || []).reduce(
+      (s, sub) => s + Number(sub.amount) * (Number(sub.charity_percentage) / 100),
+      0
     );
 
-    return res.json({ users, prizePool, charityTotals, drawStats, independentDonationStats });
+    // Draw stats
+    const { data: draws, error: drErr } = await supabase
+      .from("draws")
+      .select("published");
+    if (drErr) throw drErr;
+
+    const totalDraws = (draws || []).length;
+    const publishedDraws = (draws || []).filter((d) => d.published === true).length;
+
+    // Independent donations
+    const { data: donationRows, error: dnErr } = await supabase
+      .from("donations")
+      .select("amount");
+    if (dnErr) throw dnErr;
+
+    const totalIndependentDonations = (donationRows || []).reduce(
+      (s, d) => s + Number(d.amount),
+      0
+    );
+    const donationsCount = (donationRows || []).length;
+
+    return res.json({
+      users: { totalUsers: totalUsers || 0 },
+      prizePool: { totalPrizePool: Number(totalPrizePool.toFixed(2)) },
+      charityTotals: {
+        totalCharityContributions: Number(totalCharityContributions.toFixed(2))
+      },
+      drawStats: { totalDraws, publishedDraws },
+      independentDonationStats: {
+        totalIndependentDonations: Number(totalIndependentDonations.toFixed(2)),
+        donationsCount
+      }
+    });
   } catch (error) {
     return next(error);
   }
@@ -116,21 +163,29 @@ router.get("/admin/summary", requireAuth, requireAdmin, async (_req, res, next) 
 
 router.get("/admin/users", requireAuth, requireAdmin, async (_req, res, next) => {
   try {
-    const rows = await query(
-      `SELECT u.id, u.name, u.email, u.role, u.created_at,
-              sub.plan AS latest_plan,
-              sub.status AS latest_subscription_status,
-              sub.renewal_date AS latest_renewal_date
-       FROM users u
-       LEFT JOIN subscriptions sub ON sub.id = (
-         SELECT s2.id
-         FROM subscriptions s2
-         WHERE s2.user_id = u.id
-         ORDER BY s2.id DESC
-         LIMIT 1
-       )
-       ORDER BY u.created_at DESC`
-    );
+    const { data: users, error: uErr } = await supabase
+      .from("users")
+      .select("id, name, email, role, created_at")
+      .order("created_at", { ascending: false });
+    if (uErr) throw uErr;
+
+    // Use the view that gives us the latest subscription per user
+    const { data: latestSubs, error: sErr } = await supabase
+      .from("latest_user_subscriptions")
+      .select("user_id, plan, status, renewal_date");
+    if (sErr) throw sErr;
+
+    const subMap = new Map((latestSubs || []).map((s) => [s.user_id, s]));
+
+    const rows = (users || []).map((u) => {
+      const sub = subMap.get(u.id);
+      return {
+        ...u,
+        latest_plan: sub?.plan || null,
+        latest_subscription_status: sub?.status || null,
+        latest_renewal_date: sub?.renewal_date || null
+      };
+    });
 
     return res.json(rows);
   } catch (error) {
@@ -147,14 +202,15 @@ router.patch("/admin/users/:userId", requireAuth, requireAdmin, async (req, res,
       return res.status(400).json({ message: "Valid name, email, and role are required" });
     }
 
-    const result = await query(
-      `UPDATE users
-       SET name = ?, email = ?, role = ?
-       WHERE id = ?`,
-      [name, email, role, userId]
-    );
+    const { data, error } = await supabase
+      .from("users")
+      .update({ name, email, role })
+      .eq("id", userId)
+      .select();
 
-    if (result.affectedRows === 0) {
+    if (error) throw error;
+
+    if (!data || data.length === 0) {
       return res.status(404).json({ message: "User not found" });
     }
 
@@ -179,13 +235,18 @@ router.patch(
 
       const amount = plan === "yearly" ? 500 : 50;
 
-      await query(
-        `INSERT INTO subscriptions
-          (user_id, plan, status, amount, renewal_date, charity_percentage)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [userId, plan, status, amount, renewalDate, Number(charityPercentage || 10)]
-      );
+      const { error } = await supabase
+        .from("subscriptions")
+        .insert({
+          user_id: userId,
+          plan,
+          status,
+          amount,
+          renewal_date: renewalDate,
+          charity_percentage: Number(charityPercentage || 10)
+        });
 
+      if (error) throw error;
       return res.json({ message: "Subscription override applied" });
     } catch (error) {
       return next(error);
