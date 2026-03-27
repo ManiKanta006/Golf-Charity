@@ -20,7 +20,7 @@ const app = express();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-app.use(cors({ origin: process.env.CLIENT_URL || "http://localhost:5173" }));
+app.use(cors({ origin: "*" }));
 app.post("/api/payments/webhook", express.raw({ type: "application/json" }), handleCashfreeWebhook);
 app.use(express.json());
 
