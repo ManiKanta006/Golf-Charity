@@ -24,11 +24,9 @@ app.use(cors({ origin: "*" }));
 app.post("/api/payments/webhook", express.raw({ type: "application/json" }), handleCashfreeWebhook);
 app.use(express.json());
 
-// Only serve uploads if directory exists (for local development)
+// Serve uploads statically
 const uploadsDir = path.resolve(__dirname, "../uploads");
-if (existsSync(uploadsDir)) {
-  app.use("/uploads", express.static(uploadsDir));
-}
+app.use("/uploads", express.static(uploadsDir));
 
 app.get("/api/health", (_req, res) => {
   res.json({ status: "ok", service: "golf-charity-server" });
